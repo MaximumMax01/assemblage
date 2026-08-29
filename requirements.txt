@@ -1,0 +1,10 @@
+fastapi>=0.110.0
+uvicorn>=0.28.0
+duckduckgo_search>=5.0.0
+aiohttp>=3.9.0
+pillow>=10.2.0
+numpy>=1.26.0
+opencv-python-headless>=4.9.0.80
+torch>=2.2.0
+open-clip-torch>=2.24.0
+pydantic>=2.6.0
