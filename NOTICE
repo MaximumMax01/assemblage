@@ -1,0 +1,22 @@
+Assemblage bundles third-party code.
+
+--------------------------------------------------------------------------------
+purformat  (backend/purformat/)
+--------------------------------------------------------------------------------
+
+The .pur reader/writer in backend/purformat/ is taken from the PureRef-format
+project by Fyor, which reverse engineered the PureRef binary format:
+
+    https://github.com/FyorDev/PureRef-format
+
+It is used unmodified and is licensed under the MIT License. The full upstream
+licence text is preserved at backend/purformat/LICENSE.
+
+    MIT License
+    Copyright (c) 2023 Fyor
+
+The row-packing layout algorithm in backend/board_builder.py is adapted from the
+`pureref_gen.py` example in the same project.
+
+Assemblage would not exist without this work. Writing a .pur file at all depends
+entirely on Fyor having decoded the format first.

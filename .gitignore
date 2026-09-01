@@ -1,4 +1,8 @@
 venv/
+<<<<<<< HEAD
+=======
+.venv/
+>>>>>>> b3ed0a9 (second commit, for school)
 __pycache__/
 *.pyc
 *.pyo

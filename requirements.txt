@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 fastapi>=0.110.0
 uvicorn>=0.28.0
 duckduckgo_search>=5.0.0
@@ -8,3 +9,31 @@ opencv-python-headless>=4.9.0.80
 torch>=2.2.0
 open-clip-torch>=2.24.0
 pydantic>=2.6.0
+=======
+# Core server
+fastapi>=0.110.0
+uvicorn>=0.28.0
+pydantic>=2.6.0
+
+# Networking
+aiohttp>=3.9.0
+# Uses the OS certificate store, so TLS-inspecting networks (school, corporate)
+# work without disabling verification. Previously imported but never declared,
+# which crashed every clean install on startup.
+truststore>=0.9.0
+
+# Search. ddgs is the current name of the package formerly called
+# duckduckgo_search. Pinned to a minor range because this is an unofficial
+# wrapper that breaks when DuckDuckGo changes endpoints; the Wikimedia and
+# Openverse backends carry the load when it does.
+ddgs>=9.0.0,<10.0.0
+
+# Imaging and CV
+pillow>=10.2.0
+numpy>=1.26.0
+opencv-python-headless>=4.9.0.80
+
+# Model
+torch>=2.2.0
+open-clip-torch>=2.24.0
+>>>>>>> b3ed0a9 (second commit, for school)
