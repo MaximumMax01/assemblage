@@ -242,6 +242,41 @@ def test_short_board_returns_what_exists() -> None:
 select_board_ref = V.select_board
 
 
+
+
+
+# --------------------------------------------------------------------- #
+# Regressions from the "office ceiling tiles" board
+# --------------------------------------------------------------------- #
+
+def test_stock_hosts_blocked_by_hostname_not_substring() -> None:
+    import scraper
+    assert scraper.is_stock_host("https://thumbs.dreamstime.com/b/x.jpg")
+    assert scraper.is_stock_host("https://as1.ftcdn.net/v2/jpg/1000_F.jpg")
+    assert scraper.is_stock_host("https://www.shutterstock.com/image-photo/x.jpg")
+    assert not scraper.is_stock_host("https://upload.wikimedia.org/a/Ceiling.jpg")
+    # a path containing a blocked name must not trip the filter
+    assert not scraper.is_stock_host("https://example.com/notshutterstock.com.jpg")
+
+
+def test_subject_margin_is_relative_not_absolute() -> None:
+    """
+    An absolute subject floor would delete the ortho slot again, because line
+    drawings sit lower against a subject anchor than photographs do.
+    """
+    assert isinstance(V.SUBJECT_MARGIN, float)
+    assert 0 < V.SUBJECT_MARGIN < 0.2
+
+
+def test_query_templates_keep_subject_dominant() -> None:
+    """Nine-word queries let the modifiers outrank the subject in search."""
+    import taxonomy
+    for name, data in taxonomy.ARCHETYPE_DEFINITIONS.items():
+        for slot, tpl in data["templates"].items():
+            tail = tpl.replace("{prompt}", "").split()
+            assert len(tail) <= 4, f"{name}/{slot} has {len(tail)} modifier words: {tpl}"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
