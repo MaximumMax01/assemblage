@@ -54,6 +54,29 @@ def is_stock_host(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in STOCK_HOSTS)
 
 
+# AI image generators and upscalers. Their output is the worst possible modelling
+# reference: it looks plausible and is structurally wrong. Soffits that never
+# meet the fascia, balusters at inconsistent spacing, trim that terminates into
+# nothing. A modeller working from one of these reproduces the error, which is
+# worse than having no reference for that detail at all.
+AI_IMAGE_HOSTS = (
+    "stablediffusionweb.com", "magnific.ai", "lexica.art", "civitai.com",
+    "openart.ai", "playgroundai.com", "leonardo.ai", "easy-peasy.ai",
+    "prompthero.com", "mage.space", "nightcafe.studio", "deepai.org",
+    "artbreeder.com", "ideogram.ai", "seaart.ai", "tensor.art", "pixai.art",
+    "midjourney.com", "dreamstudio.ai", "starryai.com", "craiyon.com",
+)
+
+
+def is_ai_generated_host(url: str) -> bool:
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return False
+    host = host.lower()
+    return any(host == h or host.endswith("." + h) for h in AI_IMAGE_HOSTS)
+
+
 def clean_query_for_apis(query: str) -> str:
     """Simplifies long queries into core keywords for tag-based APIs."""
     stopwords = {
@@ -172,17 +195,21 @@ async def search_slot_urls(
 
     seen: set[str] = set()
     ordered: List[tuple[str, str]] = []
-    blocked = 0
+    stock = 0
+    ai = 0
     for url in [*ddg, *wiki, *openverse]:
         if url in seen:
             continue
         if is_stock_host(url):
-            blocked += 1
+            stock += 1
+            continue
+        if is_ai_generated_host(url):
+            ai += 1
             continue
         seen.add(url)
         ordered.append((url, slot))
-    if blocked:
-        print(f"[Scraper] {slot}: skipped {blocked} watermarked stock results.")
+    if stock or ai:
+        print(f"[Scraper] {slot}: skipped {stock} stock, {ai} AI-generated results.")
     return ordered
 
 

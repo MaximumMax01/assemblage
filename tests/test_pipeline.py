@@ -277,6 +277,64 @@ def test_query_templates_keep_subject_dominant() -> None:
             assert len(tail) <= 4, f"{name}/{slot} has {len(tail)} modifier words: {tpl}"
 
 
+
+def _si(slot, subj, style, gated=False):
+    return V.ScoredImage(image=Image.new("RGB", (8, 8)), url=f"{slot}:{subj}",
+                         slot=slot, score=style, subject=subj, gated=gated)
+
+
+def test_gated_images_fill_a_short_slot_rather_than_shrinking_the_board() -> None:
+    """
+    A slot with only two clean candidates must still reach its quota by pulling
+    a gated one back, instead of handing its place to another slot.
+    """
+    scored = (
+        [_si(HERO, 0.34, 0.25) for _ in range(6)]
+        + [_si(DETAIL, 0.30, 0.22), _si(DETAIL, 0.29, 0.19),
+           _si(DETAIL, 0.25, 0.14, gated=True)]
+        + [_si(ORTHO, 0.25, 0.24) for _ in range(4)]
+        + [_si(MATERIAL, 0.35, 0.23) for _ in range(4)]
+    )
+    board = V.select_board(scored, 12)
+    counts = {s: sum(1 for b in board if b.slot == s) for s in (HERO, ORTHO, DETAIL, MATERIAL)}
+    assert counts == {HERO: 3, ORTHO: 3, DETAIL: 3, MATERIAL: 3}, counts
+    assert sum(1 for b in board if b.gated) == 1
+
+
+def test_gated_images_never_displace_clean_ones() -> None:
+    """A gated image must lose to any ungated one in the same slot."""
+    scored = [
+        _si(HERO, 0.40, 0.40, gated=True),   # highest combined, but gated
+        _si(HERO, 0.20, 0.10),
+        _si(HERO, 0.19, 0.10),
+        _si(HERO, 0.18, 0.10),
+    ]
+    board = V.select_board(scored, 3)
+    assert not any(b.gated for b in board), "gated image displaced a clean one"
+
+
+def test_combined_score_weights_subject_over_style() -> None:
+    """
+    Wrong subject, great style must lose to right subject, mediocre style --
+    this is the mitre-joint failure mode.
+    """
+    right_subject = _si(DETAIL, 0.30, 0.10)
+    wrong_subject = _si(DETAIL, 0.19, 0.22)
+    assert right_subject.combined > wrong_subject.combined
+
+
+def test_ai_generated_hosts_blocked() -> None:
+    """
+    AI renders are structurally wrong reference -- plausible-looking geometry
+    that does not actually assemble. Both of these reached real boards.
+    """
+    import scraper
+    assert scraper.is_ai_generated_host("https://imgcdn.stablediffusionweb.com/x.png")
+    assert scraper.is_ai_generated_host("https://easy-peasy.ai/cdn-cgi/image/x.png")
+    assert not scraper.is_ai_generated_host("https://upload.wikimedia.org/a/Porch.jpg")
+    # must not be confused with the stock-photo list
+    assert not scraper.is_ai_generated_host("https://thumbs.dreamstime.com/x.jpg")
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
