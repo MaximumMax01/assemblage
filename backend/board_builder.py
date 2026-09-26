@@ -32,7 +32,6 @@ from purformat import purformat
 MAX_EDGE = 1400
 
 ROW_HEIGHT = 1000
-ROW_TARGET_WIDTH = 2000
 
 
 def _to_pur_image(img: Image.Image, name: str, source: str):
@@ -57,42 +56,65 @@ def _to_pur_image(img: Image.Image, name: str, source: str):
     return pur_image
 
 
-def _pack_rows(transforms: List) -> None:
-    """Splits transforms into rows and assigns canvas coordinates in place."""
-    for t in transforms:
-        t.scale_to_height(ROW_HEIGHT)
+# Layout, in PureRef canvas units. Every image starts at ROW_HEIGHT tall.
+CANVAS_WIDTH = 4000
+GAP = 40            # between images, and between rows within a group
+GROUP_GAP = 200     # extra space between groups, so they read as separate
 
-    total_width = sum(t.width for t in transforms)
 
-    rows = [transforms]
-    while len(rows) * float(ROW_TARGET_WIDTH) < total_width:
-        total_width /= 2.0
-        new_rows = []
+def _pack_rows(groups: List[List]) -> None:
+    """
+    Lays out images as a justified grid, one group after another.
+
+    A full row is scaled so it spans exactly CANVAS_WIDTH. A row that cannot be
+    filled -- a group's last few images -- is never scaled UP; it keeps the
+    normal row height and simply ends early.
+
+    The previous layout scaled every row to full width, including a final row
+    holding a single leftover image. That image was blown up to roughly three
+    and a half times the height of everything else, and since boards are
+    ordered with the weakest leftovers last, the image inflated was usually the
+    worst one on the board.
+
+    Each group starts on a fresh row, so hero shots, drawings, details and
+    textures never share a row.
+    """
+    y = 0.0
+    for g_index, group in enumerate(groups):
+        for t in group:
+            t.scale_to_height(ROW_HEIGHT)
+
+        rows: List[List] = []
+        current: List = []
+        for t in group:
+            current.append(t)
+            span = sum(x.width for x in current) + GAP * (len(current) - 1)
+            if span >= CANVAS_WIDTH:          # row is full: close it
+                rows.append(current)
+                current = []
+        if current:
+            rows.append(current)
+
         for row in rows:
-            remaining = total_width
-            middle_index = 0
-            while remaining > 0 and middle_index < len(row):
-                remaining -= row[middle_index].width
-                middle_index += 1
-            new_rows.append(row[:middle_index])
-            new_rows.append(row[middle_index:])
-        rows = new_rows
+            content = sum(t.width for t in row)
+            available = CANVAS_WIDTH - GAP * (len(row) - 1)
+            # Full rows shrink to fit exactly. Short rows are capped at 1.0,
+            # so they are never enlarged past normal height.
+            scale = min(1.0, available / content) if content > 0 else 1.0
 
-    placement_y = 0.0
-    for row in [r for r in rows if r]:
-        row_width = sum(t.width for t in row)
-        if row_width <= 0:
-            continue
-        scale_factor = 1000 / row_width
+            x = 0.0
+            height = 0.0
+            for t in row:
+                t.scale(scale)
+                # PureRef positions an item by its centre, not its corner.
+                t.x = x + t.width / 2
+                t.y = y + t.height / 2
+                x += t.width + GAP
+                height = max(height, t.height)
+            y += height + GAP
 
-        placement_x = 0.0
-        for t in row:
-            t.scale(scale_factor)
-            t.x = placement_x + t.width / 2
-            placement_x += t.width
-            t.y = placement_y + t.height / 2
-
-        placement_y += ROW_HEIGHT * scale_factor
+        if g_index < len(groups) - 1:
+            y += GROUP_GAP
 
 
 def build_board(
@@ -112,7 +134,16 @@ def build_board(
         for img, label, url in entries
     ]
 
-    _pack_rows([t for image in pur_file.images for t in image.transforms])
+    # Consecutive entries with the same label form a group. select_board
+    # already orders the board group by group, so this recovers the groups.
+    groups: List[List] = []
+    last_label = None
+    for (img, label, url), image in zip(entries, pur_file.images):
+        if label != last_label:
+            groups.append([])
+            last_label = label
+        groups[-1].extend(image.transforms)
+    _pack_rows(groups)
 
     pur_file.write(output_path)
     print(f"[Board] Wrote {len(entries)} images to {output_path}")

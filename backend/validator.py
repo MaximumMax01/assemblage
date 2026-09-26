@@ -13,11 +13,11 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
-from slots import SLOT_ORDER, profile_for
+from slots import MODES, OBJECT_MODE, SLOT_ORDER, SLOT_PROFILES, profile_for, slots_for
 
 # Bump when filtering behaviour changes. Printed at startup and served from
 # /health, so "is the new code actually running" is answerable in one look.
-BUILD = "2026.08.29-subject-gate"
+BUILD = "2026.09.25-fixtures-layout"
 
 # Laplacian variance scales with image resolution, so the same threshold means
 # different things for a 600px thumbnail and a 4000px scan. Every image is
@@ -59,6 +59,20 @@ class ScoredImage(NamedTuple):
     slot: str
     score: float
     subject: float = 0.0
+    gated: bool = False          # failed the subject gate; usable only as fallback
+
+    @property
+    def combined(self) -> float:
+        """
+        Ranking key within a slot.
+
+        Subject is weighted double because an image that is the wrong subject is
+        useless no matter how well it matches the slot's style, whereas a
+        slightly off-style image of the right subject is still a usable
+        reference. Ranking on style alone let a strong technical drawing of the
+        wrong object outrank a plainer photo of the right one.
+        """
+        return 2.0 * self.subject + self.score
 
 
 def _dhash(img: Image.Image, size: int = 8) -> np.ndarray:
@@ -92,9 +106,11 @@ class ReferenceValidator:
         # startup rather than once per image. Each slot gets its own set because
         # the white-background negative is correct for photographs and wrong for
         # line drawings.
+        # Every slot in every mode is covered, so switching mode per request
+        # costs nothing at request time.
         self.neg_feats: Dict[str, torch.Tensor] = {}
         with torch.no_grad():
-            for slot in SLOT_ORDER:
+            for slot in SLOT_PROFILES:
                 prompts = profile_for(slot)["negatives"]
                 tokens = self.tokenizer(prompts).to(self.device)
                 feats: Any = self.model.encode_text(tokens)
@@ -184,7 +200,7 @@ class ReferenceValidator:
     # Stage 2: batched semantic scoring
     # ------------------------------------------------------------------ #
 
-    def _encode_positives(self, prompt: str) -> Dict[str, torch.Tensor]:
+    def _encode_positives(self, prompt: str, slots: Sequence[str]) -> Dict[str, torch.Tensor]:
         """
         Encodes each slot's positive anchors once per generation.
 
@@ -193,14 +209,17 @@ class ReferenceValidator:
         """
         feats: Dict[str, torch.Tensor] = {}
         with torch.no_grad():
-            for slot in SLOT_ORDER:
+            for slot in slots:
                 prompts = [t.format(prompt=prompt) for t in profile_for(slot)["positives"]]
                 tokens = self.tokenizer(prompts).to(self.device)
                 f: Any = self.model.encode_text(tokens)
                 feats[slot] = f / f.norm(dim=-1, keepdim=True)
         return feats
 
-    def _encode_subject(self, prompt: str) -> torch.Tensor:
+    def _encode_subject(
+        self, prompt: str, mode: str = OBJECT_MODE,
+        templates: Optional[Sequence[str]] = None,
+    ) -> torch.Tensor:
         """
         Encodes the bare subject, with no slot styling attached.
 
@@ -209,9 +228,17 @@ class ReferenceValidator:
         strongly while having nothing to do with the subject, which is how a
         photograph of a castle spire ends up on a board about ceiling tiles.
         This anchor measures subject match alone.
+
+        What counts as "the subject" depends on mode: for an object it is the
+        thing itself, for a floor plan it is a plan of that kind of building,
+        so a photograph of a hotel lobby fails the plan anchor as it should.
         """
+        # An archetype may override the mode's anchor. Light fixtures do: the
+        # bare phrase "stage light" matches photos of lit stages better than
+        # photos of the fixture, so the anchor has to name the object.
+        templates = list(templates) if templates else MODES[mode]["subject_templates"]
         with torch.no_grad():
-            tokens = self.tokenizer([prompt, f"a photograph of {prompt}"]).to(self.device)
+            tokens = self.tokenizer([t.format(prompt=prompt) for t in templates]).to(self.device)
             f: Any = self.model.encode_text(tokens)
             return f / f.norm(dim=-1, keepdim=True)
 
@@ -227,7 +254,12 @@ class ReferenceValidator:
         return torch.cat(chunks, dim=0)
 
     def score_candidates(
-        self, survivors: Sequence[Tuple[Image.Image, str, str]], prompt: str
+        self,
+        survivors: Sequence[Tuple[Image.Image, str, str]],
+        prompt: str,
+        mode: str = OBJECT_MODE,
+        subject_templates: Optional[Sequence[str]] = None,
+        extra_negatives: Optional[Sequence[str]] = None,
     ) -> List[ScoredImage]:
         """
         Scores prefiltered images against their own slot's anchors.
@@ -239,8 +271,23 @@ class ReferenceValidator:
 
         images = [s[0] for s in survivors]
         img_feats = self._encode_images(images)
-        pos_feats = self._encode_positives(prompt)
-        subj_feats = self._encode_subject(prompt)
+        present = list(dict.fromkeys(s[2] for s in survivors))
+        pos_feats = self._encode_positives(prompt, present)
+        subj_feats = self._encode_subject(prompt, mode, subject_templates)
+
+        # Archetype negatives are added to every slot's own negatives for this
+        # run. They are encoded per request because they depend on the
+        # archetype, and there are only a handful of them.
+        neg_by_slot: Dict[str, torch.Tensor] = {}
+        extra_feats = None
+        if extra_negatives:
+            with torch.no_grad():
+                tokens = self.tokenizer(list(extra_negatives)).to(self.device)
+                f: Any = self.model.encode_text(tokens)
+                extra_feats = f / f.norm(dim=-1, keepdim=True)
+        for slot in present:
+            base = self.neg_feats[slot]
+            neg_by_slot[slot] = base if extra_feats is None else torch.cat([base, extra_feats], dim=0)
 
         # Embedding-level dedup. Greedy: walk in order and drop anything too
         # close to something already kept.
@@ -275,27 +322,32 @@ class ReferenceValidator:
             feat = img_feats[i]
             subj = subject_sim[i]
             pos = float((feat @ pos_feats[slot].T).mean().item())
-            neg = float((feat @ self.neg_feats[slot].T).mean().item())
+            neg = float((feat @ neg_by_slot[slot].T).mean().item())
             score = pos - 0.75 * neg
 
-            reason = ""
-            # Relative gate: far off-subject compared with the best this slot
-            # found. Relative rather than absolute because line drawings sit
-            # lower against a subject anchor than photographs do.
-            if subj < best_in_slot[slot] - SUBJECT_MARGIN:
-                reason = f"off-subject (best {best_in_slot[slot]:.3f})"
-            elif SUBJECT_FLOOR and subj < SUBJECT_FLOOR:
-                reason = "below subject floor"
-            elif score < profile["min_score"]:
-                reason = f"style score < {profile['min_score']}"
+            # Style floor is a hard drop: too weak to be worth showing at all.
+            if score < profile["min_score"]:
+                report.append((slot, subj, score,
+                               f"dropped: style < {profile['min_score']}", url))
+                continue
 
-            report.append((slot, subj, score, reason, url))
-            if not reason:
-                scored.append(ScoredImage(image=img, url=url, slot=slot,
-                                          score=score, subject=subj))
+            # The subject gate MARKS rather than drops. A gated image is held in
+            # reserve and used only if its slot cannot otherwise fill its quota.
+            # Dropping outright starved thin slots -- the detail slot returned
+            # two images against a quota of three -- while pruning hard in slots
+            # that had plenty of candidates and did not need the help.
+            gated = subj < best_in_slot[slot] - SUBJECT_MARGIN
+            if not gated and SUBJECT_FLOOR and subj < SUBJECT_FLOOR:
+                gated = True
 
-        dropped = sum(1 for r in report if r[3])
-        print(f"[Validator] Kept {len(scored)}, dropped {dropped} on subject/style.")
+            verdict = f"gated (best {best_in_slot[slot]:.3f})" if gated else "KEPT"
+            report.append((slot, subj, score, verdict, url))
+            scored.append(ScoredImage(image=img, url=url, slot=slot,
+                                      score=score, subject=subj, gated=gated))
+
+        n_gated = sum(1 for s in scored if s.gated)
+        print(f"[Validator] {len(scored) - n_gated} kept, {n_gated} gated as reserve, "
+              f"{len(report) - len(scored)} dropped on style.")
 
         if VERBOSE:
             print(f"{'slot':<9}{'subject':>8}{'style':>8}  {'verdict':<34}url")
@@ -311,7 +363,9 @@ class ReferenceValidator:
 # ---------------------------------------------------------------------- #
 
 def select_board(
-    scored: Sequence[ScoredImage], target_count: int
+    scored: Sequence[ScoredImage],
+    target_count: int,
+    slot_order: Optional[Sequence[str]] = None,
 ) -> List[ScoredImage]:
     """
     Picks the final board with a per-slot quota instead of a global top-N.
@@ -329,15 +383,29 @@ def select_board(
     if not scored:
         return []
 
-    by_slot: Dict[str, List[ScoredImage]] = {slot: [] for slot in SLOT_ORDER}
+    # The order slots are laid out in. Any slot present in the results but
+    # missing from the order is appended rather than ignored. Ignoring it was a
+    # real bug: plan-mode slots are not in SLOT_ORDER, so every one of them
+    # would have been skipped and the quota silently replaced by a global
+    # top-N, which is the exact failure the quota exists to prevent.
+    order: List[str] = list(slot_order) if slot_order else list(SLOT_ORDER)
+    for item in scored:
+        if item.slot not in order:
+            order.append(item.slot)
+
+    by_slot: Dict[str, List[ScoredImage]] = {slot: [] for slot in order}
     for item in scored:
         by_slot.setdefault(item.slot, []).append(item)
-    for slot in by_slot:
-        by_slot[slot].sort(key=lambda s: s.score, reverse=True)
 
-    active_slots = [s for s in SLOT_ORDER if by_slot.get(s)]
+    # Within a slot, rank by combined subject+style. Gated images sort last
+    # regardless of score, so they are only reached when the clean pool runs
+    # out before the quota does.
+    for slot in by_slot:
+        by_slot[slot].sort(key=lambda s: (s.gated, -s.combined))
+
+    active_slots = [s for s in order if by_slot.get(s)]
     if not active_slots:
-        return sorted(scored, key=lambda s: s.score, reverse=True)[:target_count]
+        return sorted(scored, key=lambda s: (s.gated, -s.combined))[:target_count]
 
     base = target_count // len(active_slots)
     remainder = target_count % len(active_slots)
@@ -351,14 +419,14 @@ def select_board(
         selected.extend(pool[:quota])
         leftovers.extend(pool[quota:])
 
-    # Backfill any places the quota could not fill, best score first.
+    # Backfill unfilled places, preferring ungated images from any slot.
     if len(selected) < target_count:
-        leftovers.sort(key=lambda s: s.score, reverse=True)
+        leftovers.sort(key=lambda s: (s.gated, -s.combined))
         selected.extend(leftovers[:target_count - len(selected)])
 
     # Group by slot in the output order so the board reads as four categories
     # rather than a shuffle. The layout engine places images sequentially, so
     # ordering here is what produces visual grouping on the canvas.
-    slot_rank = {slot: i for i, slot in enumerate(SLOT_ORDER)}
-    selected.sort(key=lambda s: (slot_rank.get(s.slot, 99), -s.score))
+    slot_rank = {slot: i for i, slot in enumerate(order)}
+    selected.sort(key=lambda s: (slot_rank.get(s.slot, 99), -s.combined))
     return selected

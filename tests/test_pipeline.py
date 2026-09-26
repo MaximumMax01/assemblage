@@ -335,6 +335,185 @@ def test_ai_generated_hosts_blocked() -> None:
     # must not be confused with the stock-photo list
     assert not scraper.is_ai_generated_host("https://thumbs.dreamstime.com/x.jpg")
 
+
+# --------------------------------------------------------------------- #
+# Floor-plan mode, hints, and edited searches
+# --------------------------------------------------------------------- #
+
+import taxonomy as T  # noqa: E402
+import slots as S     # noqa: E402
+
+
+def test_floor_plan_prompts_switch_mode_and_strip_the_view_type() -> None:
+    assert T.detect_mode("Floor plan hotel") == (S.PLAN_MODE, "hotel")
+    assert T.detect_mode("floor plan of a small office") == (S.PLAN_MODE, "small office")
+    assert T.detect_mode("backrooms office floorplans") == (S.PLAN_MODE, "backrooms office")
+    assert T.detect_mode("office ceiling tiles")[0] == S.OBJECT_MODE
+
+
+def test_every_mode_slot_is_fully_defined() -> None:
+    for name, mode in S.MODES.items():
+        assert len(mode["slots"]) == 4, name
+        for tpl in mode["subject_templates"]:
+            assert "{prompt}" in tpl
+        for slot in mode["slots"]:
+            p = S.profile_for(slot)
+            assert p["label"] and p["description"], slot
+            assert all("{prompt}" in t for t in p["positives"]), slot
+            assert S.mode_of(slot) == name
+
+
+def test_plan_slots_never_white_gate() -> None:
+    """Plans are drawings; drawings are mostly white paper. Same lesson as ORTHO."""
+    for slot in S.slots_for(S.PLAN_MODE):
+        assert S.profile_for(slot)["white_gate"] is None, slot
+
+
+def test_plan_templates_keep_subject_dominant() -> None:
+    for slot, tpl in T.PLAN_TEMPLATES.items():
+        assert len(tpl.replace("{prompt}", "").split()) <= 4, tpl
+
+
+def test_profile_for_rejects_unknown_slots() -> None:
+    try:
+        S.profile_for("hero_typo")
+    except ValueError:
+        return
+    raise AssertionError("unknown slot silently accepted")
+
+
+def test_select_board_applies_quota_to_plan_slots() -> None:
+    """
+    Regression: plan slots were missing from SLOT_ORDER, so select_board skipped
+    them all and fell back to a global top-N with no quota.
+    """
+    order = S.slots_for(S.PLAN_MODE)
+    scored = (
+        [_si(order[0], 0.35, 0.30) for _ in range(10)]    # dominates raw score
+        + [_si(order[1], 0.20, 0.10) for _ in range(4)]
+        + [_si(order[2], 0.21, 0.11) for _ in range(4)]
+        + [_si(order[3], 0.22, 0.12) for _ in range(4)]
+    )
+    board = V.select_board(scored, 12, order)
+    counts = [sum(1 for b in board if b.slot == sl) for sl in order]
+    assert counts == [3, 3, 3, 3], counts
+    # and without an explicit order it must still not drop them
+    board2 = V.select_board(scored, 12)
+    assert [sum(1 for b in board2 if b.slot == sl) for sl in order] == [3, 3, 3, 3]
+
+
+def test_mood_words_get_concrete_suggestions() -> None:
+    mode, subj = T.detect_mode("backrooms floor plan")
+    hints = T.prompt_hints("backrooms floor plan", mode, subj)
+    assert hints and hints[0]["kind"] == "mood"
+    assert "tenant improvement floor plan" in hints[0]["suggestions"]
+
+
+def test_scene_hint_uses_head_noun_only() -> None:
+    """'office ceiling tiles' is about tiles; 'modern office' is about a room."""
+    def kinds(p):
+        m, s = T.detect_mode(p)
+        return [h["kind"] for h in T.prompt_hints(p, m, s)]
+    assert "scene" not in kinds("office ceiling tiles")
+    assert "scene" in kinds("modern office")
+
+
+def test_exterior_scenes_do_not_suggest_floor_plans() -> None:
+    m, subj = T.detect_mode("house front")
+    hint = T.prompt_hints("house front", m, subj)[0]
+    assert hint["kind"] == "scene" and hint["suggestions"] == []
+
+
+def test_overrides_validate_and_blank_switches_a_slot_off() -> None:
+    mode, qs = T.resolve_overrides([("hero", "oak chair"), ("ortho", "   "),
+                                    ("detail", "oak chair joint"), ("material", "oak grain")])
+    assert mode == S.OBJECT_MODE
+    assert [q.slot for q in qs] == ["hero", "detail", "material"]
+
+    bad = [
+        [("hero", "x"), ("plan_simple", "y")],     # mixed modes
+        [("hero", "x"), ("hero", "y")],            # duplicate slot
+        [("nonsense", "x")],                       # unknown slot
+        [("hero", ""), ("ortho", " ")],            # everything blank
+        [("hero", "x" * 201)],                     # too long
+    ]
+    for case in bad:
+        try:
+            T.resolve_overrides(case)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted invalid overrides: {case}")
+
+
+# --------------------------------------------------------------------- #
+# Light fixtures, and the board layout
+# --------------------------------------------------------------------- #
+
+def test_light_nouns_route_to_fixture_archetype_by_head_noun() -> None:
+    assert T.route_archetype("stage light") == "lighting_fixture"
+    assert T.route_archetype("ceiling stage light") == "lighting_fixture"
+    assert T.route_archetype("fluorescent troffer light") == "lighting_fixture"
+    assert T.route_archetype("brass chandelier") == "lighting_fixture"
+    # "light" as an adjective or a modifier is not a light
+    assert T.route_archetype("light oak table") is None
+    assert T.route_archetype("light switch") is None
+
+
+def test_stage_light_plan_asks_for_the_fixture_not_the_glow() -> None:
+    engine = T.TaxonomyEngine.__new__(T.TaxonomyEngine)   # routing needs no model
+    plan = engine.plan("stage light")
+    assert plan.archetype == "lighting_fixture"
+    assert plan.kind_label == "Light fixture"
+    assert all("stage light" in q.query for q in plan.queries)
+    assert any("fixture" in q.query for q in plan.queries)
+    assert plan.extra_negatives, "fixture archetype must push against the lit-stage sense"
+    assert all("{prompt}" in t for t in plan.subject_templates)
+
+
+def test_every_archetype_has_a_label() -> None:
+    for name, data in T.ARCHETYPE_DEFINITIONS.items():
+        assert data.get("label"), name
+
+
+def _layout(group_aspects):
+    import board_builder as BB
+    import purformat.items as items
+    groups = []
+    for aspects in group_aspects:
+        g = []
+        for a in aspects:
+            t = items.PurGraphicsImageItem()
+            t.reset_crop(int(1000 * a), 1000)
+            g.append(t)
+        groups.append(g)
+    BB._pack_rows(groups)
+    return BB, groups
+
+
+def test_layout_never_enlarges_a_short_row() -> None:
+    """
+    Regression: the old layout stretched every row to full width, so a single
+    leftover image came out about 3.5x the height of everything else.
+    """
+    BB, groups = _layout([[1.5, 1.0, 1.1, 1.0], [1.3, 1.3, 2.0], [1.0, 1.6, 0.9, 1.9], [1.45]])
+    heights = [t.height for g in groups for t in g]
+    assert max(heights) <= BB.ROW_HEIGHT + 1e-6, max(heights)
+    lone = groups[-1][0].height
+    typical = sorted(heights)[len(heights) // 2]
+    assert lone <= typical * 1.5, f"lone image {lone:.0f} vs typical {typical:.0f}"
+
+
+def test_layout_keeps_groups_on_separate_rows_and_inside_the_canvas() -> None:
+    BB, groups = _layout([[1.0, 1.0, 1.0], [1.3], [1.3, 2.0, 1.0, 1.6, 0.9], [1.9, 1.45, 1.0]])
+    def top(t): return t.y - t.height / 2
+    def bottom(t): return t.y + t.height / 2
+    for a, b in zip(groups, groups[1:]):
+        assert max(bottom(t) for t in a) < min(top(t) for t in b), "groups overlap vertically"
+    for g in groups:
+        for t in g:
+            assert t.x - t.width / 2 >= -1e-6
+            assert t.x + t.width / 2 <= BB.CANVAS_WIDTH + 1e-6
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

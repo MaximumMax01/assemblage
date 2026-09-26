@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, TypedDict
 
 class SlotProfile(TypedDict):
     label: str
+    description: str
     positives: List[str]
     negatives: List[str]
     white_gate: Optional[float]
@@ -41,11 +42,21 @@ ORTHO = "ortho"
 DETAIL = "detail"
 MATERIAL = "material"
 
+# Floor-plan mode. "Floor plan" is a view type, not an object, so the object
+# slots do not apply to it: a floor plan has no hero shot and no joinery detail.
+# These four split plans the way a modeller actually uses them.
+PLAN_SIMPLE = "plan_simple"
+PLAN_DIMS = "plan_dims"
+PLAN_FURNISHED = "plan_furnished"
+PLAN_CUTAWAY = "plan_cutaway"
+
+# Kept for backwards compatibility: the default (object) mode's slot order.
 SLOT_ORDER = [HERO, ORTHO, DETAIL, MATERIAL]
 
 SLOT_PROFILES: Dict[str, SlotProfile] = {
     HERO: {
         "label": "Form & silhouette",
+        "description": "the whole object, three-quarter view",
         "positives": [
             "sharp photograph of {prompt}",
             "three quarter perspective view of {prompt}",
@@ -64,6 +75,7 @@ SLOT_PROFILES: Dict[str, SlotProfile] = {
     },
     ORTHO: {
         "label": "Orthographic & technical",
+        "description": "blueprints, elevations and cross-sections",
         "positives": [
             "orthographic technical drawing of {prompt}",
             "blueprint schematic diagram of {prompt}",
@@ -85,6 +97,7 @@ SLOT_PROFILES: Dict[str, SlotProfile] = {
     },
     DETAIL: {
         "label": "Joinery & construction",
+        "description": "corners, seams, how it goes together",
         "positives": [
             "close up photograph of the construction detail of {prompt}",
             "joint seam and assembly detail of {prompt}",
@@ -101,6 +114,7 @@ SLOT_PROFILES: Dict[str, SlotProfile] = {
     },
     MATERIAL: {
         "label": "Material & surface",
+        "description": "texture, wear and roughness up close",
         "positives": [
             "macro surface texture of {prompt}",
             "photogrammetry material scan of {prompt}",
@@ -117,9 +131,127 @@ SLOT_PROFILES: Dict[str, SlotProfile] = {
         "min_dim": 600,
         "min_score": 0.05,
     },
+
+    # ---- floor-plan mode -------------------------------------------------
+    # Every plan slot has the white gate disabled for the same reason ORTHO
+    # does: plans are drawings, and drawings are mostly white paper.
+    PLAN_SIMPLE: {
+        "label": "Simple plans",
+        "description": "clean line plans that are easy to block out",
+        "positives": [
+            "simple black and white floor plan of {prompt}",
+            "clean architectural line drawing floor plan of {prompt}",
+            "minimal schematic room layout of {prompt}",
+        ],
+        # Pushing against colour and 3D is what separates this slot from the
+        # furnished and cutaway slots, which otherwise match the same images.
+        "negatives": _UNIVERSAL_NEGATIVES + [
+            "photorealistic 3d rendered interior",
+            "colorful furnished real estate floor plan",
+        ],
+        "white_gate": None,
+        "min_laplacian": 20.0,
+        "max_aspect": 4.0,
+        "min_dim": 500,
+        "min_score": 0.03,
+    },
+    PLAN_DIMS: {
+        "label": "Dimensioned",
+        "description": "measured plans, so rooms come out the right size",
+        "positives": [
+            "floor plan of {prompt} with dimension lines and measurements",
+            "architectural construction drawing plan of {prompt} with dimensions",
+            "measured drawing floor plan of {prompt}",
+        ],
+        "negatives": _UNIVERSAL_NEGATIVES + [
+            "photorealistic 3d rendered interior",
+        ],
+        "white_gate": None,
+        "min_laplacian": 20.0,
+        "max_aspect": 4.0,
+        "min_dim": 500,
+        "min_score": 0.03,
+    },
+    PLAN_FURNISHED: {
+        "label": "Furnished",
+        "description": "furniture and fixtures placed in each room",
+        "positives": [
+            "furnished floor plan of {prompt} with furniture layout",
+            "colored floor plan of {prompt} showing furniture and fixtures",
+            "interior layout plan of {prompt} with desks and seating",
+        ],
+        "negatives": _UNIVERSAL_NEGATIVES + [
+            "photorealistic 3d rendered interior",
+        ],
+        "white_gate": None,
+        "min_laplacian": 30.0,
+        "max_aspect": 4.0,
+        "min_dim": 500,
+        "min_score": 0.03,
+    },
+    PLAN_CUTAWAY: {
+        "label": "3D cutaway",
+        "description": "wall heights and room volumes, seen from above",
+        "positives": [
+            "3d cutaway floor plan of {prompt}",
+            "isometric axonometric floor plan render of {prompt}",
+            "dollhouse view 3d floor plan of {prompt}",
+        ],
+        "negatives": _UNIVERSAL_NEGATIVES + [
+            "flat 2d black and white line drawing",
+        ],
+        "white_gate": None,
+        "min_laplacian": 40.0,
+        "max_aspect": 3.2,
+        "min_dim": 500,
+        "min_score": 0.03,
+    },
+}
+
+
+OBJECT_MODE = "object"
+PLAN_MODE = "plan"
+
+# A mode bundles the slots a board is split into with the anchor used to judge
+# subject relevance. The subject anchor differs by mode: for an object the
+# question is "is this that thing", for a plan it is "is this a floor plan of
+# that kind of building". A photograph of a hotel lobby should fail the second.
+MODES: Dict[str, dict] = {
+    OBJECT_MODE: {
+        "label": "Object reference",
+        "slots": [HERO, ORTHO, DETAIL, MATERIAL],
+        "subject_templates": ["{prompt}", "a photograph of {prompt}"],
+    },
+    PLAN_MODE: {
+        "label": "Floor plans",
+        "slots": [PLAN_SIMPLE, PLAN_DIMS, PLAN_FURNISHED, PLAN_CUTAWAY],
+        "subject_templates": ["floor plan of {prompt}", "{prompt} floor plan"],
+    },
 }
 
 
 def profile_for(slot: str) -> SlotProfile:
-    """Returns the scoring profile for a slot, falling back to HERO."""
-    return SLOT_PROFILES.get(slot, SLOT_PROFILES[HERO])
+    """
+    Returns the scoring profile for a slot.
+
+    Raises on an unknown slot rather than falling back to a default. Slot ids now
+    arrive from the browser when a user edits their searches, so a silent
+    fallback would let a typo or a stale page quietly score everything with the
+    wrong filters.
+    """
+    try:
+        return SLOT_PROFILES[slot]
+    except KeyError:
+        raise ValueError(f"Unknown slot: {slot!r}") from None
+
+
+def mode_of(slot: str) -> str:
+    """Returns the mode a slot belongs to."""
+    for name, mode in MODES.items():
+        if slot in mode["slots"]:
+            return name
+    raise ValueError(f"Slot {slot!r} belongs to no mode")
+
+
+def slots_for(mode: str) -> List[str]:
+    return list(MODES[mode]["slots"])

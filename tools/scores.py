@@ -47,7 +47,7 @@ async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt")
     ap.add_argument("--count", type=int, default=12)
-    ap.add_argument("--slot", help="only show one slot (hero/ortho/detail/material)")
+    ap.add_argument("--slot", help="only show one slot id, e.g. ortho or plan_simple")
     args = ap.parse_args()
 
     print(f"build {BUILD}   margin {SUBJECT_MARGIN}   floor {SUBJECT_FLOOR}\n")
@@ -55,7 +55,13 @@ async def main() -> None:
     validator = ReferenceValidator()
     taxonomy = TaxonomyEngine(validator.model, validator.tokenizer, validator.device)
 
-    queries = await taxonomy.generate_reference_queries(args.prompt)
+    plan = taxonomy.plan(args.prompt)
+    queries = plan.queries
+    print(f"\nMode: {plan.mode}   archetype: {plan.archetype} ({plan.kind_label})   subject: {plan.subject!r}")
+    for h in plan.hints:
+        print(f"  hint ({h['kind']}): {h['text']}")
+        if h["suggestions"]:
+            print(f"    try: {', '.join(h['suggestions'])}")
     print("\nQueries")
     for q in queries:
         print(f"  {profile_for(q.slot)['label']:<26} {q.query}")
@@ -78,18 +84,27 @@ async def main() -> None:
     assert V.ReferenceValidator is ReferenceValidator, "duplicate module import"
     V.VERBOSE = True
     print()
-    scored = validator.score_candidates(survivors, args.prompt)
+    scored = validator.score_candidates(survivors, plan.subject, plan.mode,
+                                        plan.subject_templates, plan.extra_negatives)
 
-    board = select_board(scored, args.count)
+    board = select_board(scored, args.count, [q.slot for q in queries])
     print(f"\nBoard: {len(board)} images")
     for item in board:
+        tag = "  [reserve]" if item.gated else ""
         print(f"  {item.slot:<9} subject {item.subject:.3f}  style {item.score:.3f}  "
-              f"{item.url[:66]}")
+              f"combined {item.combined:.3f}  {item.url[:52]}{tag}")
 
-    print("\nPer-slot subject range among kept images:")
+    print("\nPer-slot subject range:")
     for slot in sorted({s.slot for s in scored}):
-        vals = [s.subject for s in scored if s.slot == slot]
-        print(f"  {slot:<9} {min(vals):.3f} .. {max(vals):.3f}   ({len(vals)} kept)")
+        clean = [s.subject for s in scored if s.slot == slot and not s.gated]
+        reserve = [s.subject for s in scored if s.slot == slot and s.gated]
+        line = f"  {slot:<9} clean {len(clean):>2}"
+        if clean:
+            line += f" ({min(clean):.3f}..{max(clean):.3f})"
+        line += f"   reserve {len(reserve):>2}"
+        if reserve:
+            line += f" ({min(reserve):.3f}..{max(reserve):.3f})"
+        print(line)
 
 
 if __name__ == "__main__":

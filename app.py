@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+import traceback
 import uuid
 
 # Ensure backend directory is in Python search path
@@ -17,18 +18,22 @@ if BACKEND_DIR not in sys.path:
 # on startup with ModuleNotFoundError before anything else ran.
 from backend.net import apply_ssl_workarounds
 
+# What is ssl? SSL (Secure Sockets Layer) is a standard security protocol for establishing encrypted links between a web server and a browser. It ensures that all data passed between the web server and browsers remain private and integral.
+# What does this function do for us? It applies necessary workarounds for SSL/TLS issues that might arise when making network requests, ensuring that the application can securely communicate over HTTPS even in environments with non-standard certificate configurations.
 apply_ssl_workarounds()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
 from PIL import Image
 
 from backend.board_builder import build_board, launch_board
 from backend.scraper import fetch_all_candidates
-from backend.slots import profile_for
-from backend.taxonomy import TaxonomyEngine
+from backend.slots import MODES, profile_for, slots_for
+from backend.taxonomy import QueryPlan, SlotQuery, TaxonomyEngine, detect_mode, resolve_overrides
 from backend.validator import BUILD, ReferenceValidator, select_board
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -47,9 +52,45 @@ validator = ReferenceValidator()
 taxonomy_engine = TaxonomyEngine(validator.model, validator.tokenizer, validator.device)
 
 
+class SearchOverride(BaseModel):
+    slot: str = Field(max_length=40)
+    query: str = Field(default="", max_length=400)
+
+
+class PlanRequest(BaseModel):
+    prompt: str = Field(max_length=300)
+
+
 class PromptRequest(BaseModel):
-    prompt: str
-    target_count: int = 12
+    prompt: str = Field(max_length=300)
+    # Bounded so a bad client cannot ask for a 10,000-image board.
+    target_count: int = Field(default=12, ge=4, le=24)
+    # Searches as the user left them in the browser. Omitted means "use what
+    # the prompt generates"; a blank query switches that slot off.
+    queries: Optional[List[SearchOverride]] = None
+
+
+def _slot_meta(slot_ids):
+    return [
+        {"id": sid, "label": profile_for(sid)["label"],
+         "description": profile_for(sid)["description"]}
+        for sid in slot_ids
+    ]
+
+
+def _plan_payload(plan: QueryPlan) -> dict:
+    return {
+        "mode": plan.mode,
+        "mode_label": MODES[plan.mode]["label"],
+        # Shown in the title block, so the user can see "stage light" was read
+        # as a light fixture, not as lighting.
+        "kind_label": plan.kind_label or MODES[plan.mode]["label"],
+        "archetype": plan.archetype,
+        "subject": plan.subject,
+        "slots": _slot_meta(slots_for(plan.mode)),
+        "queries": [{"slot": q.slot, "query": q.query} for q in plan.queries],
+        "hints": plan.hints,
+    }
 
 
 def _safe_join(base: str, *parts: str) -> str:
@@ -91,96 +132,155 @@ async def health():
     return {"status": "ok", "device": validator.device, "build": BUILD}
 
 
+@app.post("/api/plan")
+async def plan(req: PlanRequest):
+    """
+    Returns the searches a prompt would run, without running them.
+
+    The browser calls this whenever typing pauses, so the user sees and can edit
+    the searches before spending a run on them.
+    """
+    if not req.prompt.strip():
+        return {"mode": None, "slots": [], "queries": [], "hints": []}
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, lambda: taxonomy_engine.plan(req.prompt))
+    return _plan_payload(result)
+
+
+def _resolve_request(req: PromptRequest, generated: QueryPlan):
+    """
+    Works out (mode, subject, queries, subject_templates, extra_negatives).
+
+    Edited searches win over generated ones. The subject and the archetype's
+    scoring overrides still come from the prompt, but only when the edited
+    searches belong to the same mode the prompt produced. If they do not (the
+    user changed the prompt and ran before the plan refreshed), the overrides
+    are dropped rather than applied to a subject they were not written for.
+    """
+    extras = (generated.subject_templates, generated.extra_negatives)
+    if not req.queries:
+        return (generated.mode, generated.subject, generated.queries) + extras
+    try:
+        mode, queries = resolve_overrides([(q.slot, q.query) for q in req.queries])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    detected_mode, detected_subject = detect_mode(req.prompt)
+    if detected_mode == mode:
+        return (mode, generated.subject or "building", queries) + extras
+    return (mode, detected_subject or "building", queries, (), ())
+
+
 @app.post("/api/generate")
 async def generate(req: PromptRequest):
+    # Everything that can reject the request happens here, before streaming
+    # starts. Once a StreamingResponse has begun, the status code is already
+    # 200 and a validation error can only be reported inside the stream.
+    if not req.prompt.strip() and not req.queries:
+        raise HTTPException(status_code=422, detail="Describe what you are modelling first.")
+    loop = asyncio.get_event_loop()
+    generated = await loop.run_in_executor(None, lambda: taxonomy_engine.plan(req.prompt or ""))
+    mode, subject, slot_queries, subject_templates, extra_negatives = _resolve_request(req, generated)
+
     async def run_pipeline():
-        session_id = uuid.uuid4().hex[:8]
-        session_preview_dir = os.path.join(PREVIEW_DIR, session_id)
-        os.makedirs(session_preview_dir, exist_ok=True)
-        loop = asyncio.get_event_loop()
+        # Anything that goes wrong mid-build must reach the browser as an error.
+        # Without this, an exception simply ended the stream: the page was left
+        # showing a stale progress stage forever, and the only record of the
+        # failure was a traceback in the terminal.
+        try:
+            session_id = uuid.uuid4().hex[:8]
+            session_preview_dir = os.path.join(PREVIEW_DIR, session_id)
+            os.makedirs(session_preview_dir, exist_ok=True)
+            loop = asyncio.get_event_loop()
 
-        # 1. Slot-tagged query expansion
-        yield _sse({"status": "Reading the subject", "stage": 1})
-        slot_queries = await taxonomy_engine.generate_reference_queries(req.prompt)
-        yield _sse({
-            "status": "Built four searches",
-            "stage": 2,
-            "queries": [{"slot": sq.slot, "label": profile_for(sq.slot)["label"],
-                         "query": sq.query} for sq in slot_queries],
-        })
-
-        # 2. Ingestion, preserving which slot found each image
-        yield _sse({"status": "Searching", "stage": 3})
-        candidates = await fetch_all_candidates(slot_queries)
-        if not candidates:
-            yield _sse({"error": "Nothing downloaded. Check your connection, "
-                                 "or try a shorter subject.", "stage": 3})
-            return
-
-        yield _sse({"status": f"Found {len(candidates)} images", "stage": 4})
-
-        # 3. Cheap gates and duplicate removal
-        survivors = await loop.run_in_executor(
-            None, lambda: validator.prefilter_all(candidates)
-        )
-        if not survivors:
-            yield _sse({"error": "Everything failed the sharpness and size checks. "
-                                 "Try a more common subject.", "stage": 4})
-            return
-
-        # 4. Slot-aware semantic scoring
-        yield _sse({"status": f"Sorting {len(survivors)} into slots", "stage": 5})
-        scored = await loop.run_in_executor(
-            None, lambda: validator.score_candidates(survivors, req.prompt)
-        )
-        if not scored:
-            yield _sse({"error": "Nothing matched the subject closely enough. "
-                                 "Try naming the object more directly.", "stage": 5})
-            return
-
-        # 5. Per-slot quota selection
-        board = select_board(scored, req.target_count)
-
-        breakdown: dict = {}
-        for item in board:
-            label = profile_for(item.slot)["label"]
-            breakdown[label] = breakdown.get(label, 0) + 1
-        yield _sse({"status": f"Packing {len(board)} images", "stage": 6,
-                    "breakdown": breakdown})
-
-        # 6. Previews. Each carries its slot and source so the client can group
-        # results by category rather than showing an undifferentiated grid.
-        previews = []
-        for idx, item in enumerate(board):
-            thumb_filename = f"thumb_{idx}.jpg"
-            save_thumbnail(item.image, os.path.join(session_preview_dir, thumb_filename))
-            previews.append({
-                "url": f"/api/preview/{session_id}/{thumb_filename}",
-                "slot": item.slot,
-                "label": profile_for(item.slot)["label"],
-                "source": item.url,
-                "score": round(item.score, 4),
-                "subject": round(item.subject, 4),
+            # 1. The plan was resolved before streaming began; announce it.
+            yield _sse({"status": "Reading the subject", "stage": 1})
+            yield _sse({
+                "status": f"Running {len(slot_queries)} searches",
+                "stage": 2,
+                "mode": mode,
+                "slots": _slot_meta([q.slot for q in slot_queries]),
+                "queries": [{"slot": sq.slot, "label": profile_for(sq.slot)["label"],
+                             "query": sq.query} for sq in slot_queries],
             })
 
-        # 7. Compile the .pur canvas
-        slug = re.sub(r"[^A-Za-z0-9]+", "_", req.prompt)[:24].strip("_") or "board"
-        filename = f"assemblage_{slug}_{session_id}.pur"
-        out_path = os.path.join(EXPORT_DIR, filename)
+            # 2. Ingestion, preserving which slot found each image
+            yield _sse({"status": "Searching", "stage": 3})
+            candidates = await fetch_all_candidates(slot_queries)
+            if not candidates:
+                yield _sse({"error": "Nothing downloaded. Check your connection, "
+                                     "or try a shorter subject.", "stage": 3})
+                return
 
-        entries = [
-            (item.image, profile_for(item.slot)["label"], item.url) for item in board
-        ]
-        await loop.run_in_executor(None, lambda: build_board(entries, out_path))
-        await loop.run_in_executor(None, lambda: launch_board(out_path))
+            yield _sse({"status": f"Found {len(candidates)} images", "stage": 4})
 
-        yield _sse({
-            "complete": True,
-            "count": len(board),
-            "breakdown": breakdown,
-            "download_url": f"/api/download/{filename}",
-            "previews": previews,
-        })
+            # 3. Cheap gates and duplicate removal
+            survivors = await loop.run_in_executor(
+                None, lambda: validator.prefilter_all(candidates)
+            )
+            if not survivors:
+                yield _sse({"error": "Everything failed the sharpness and size checks. "
+                                     "Try a more common subject.", "stage": 4})
+                return
+
+            # 4. Slot-aware semantic scoring
+            yield _sse({"status": f"Sorting {len(survivors)} into slots", "stage": 5})
+            scored = await loop.run_in_executor(
+                None, lambda: validator.score_candidates(
+                    survivors, subject, mode, subject_templates, extra_negatives)
+            )
+            if not scored:
+                yield _sse({"error": "Nothing matched the subject closely enough. "
+                                     "Try naming the object more directly.", "stage": 5})
+                return
+
+            # 5. Per-slot quota selection
+            board = select_board(scored, req.target_count, [q.slot for q in slot_queries])
+
+            breakdown: dict = {}
+            for item in board:
+                label = profile_for(item.slot)["label"]
+                breakdown[label] = breakdown.get(label, 0) + 1
+            yield _sse({"status": f"Packing {len(board)} images", "stage": 6,
+                        "breakdown": breakdown})
+
+            # 6. Previews. Each carries its slot and source so the client can group
+            # results by category rather than showing an undifferentiated grid.
+            previews = []
+            for idx, item in enumerate(board):
+                thumb_filename = f"thumb_{idx}.jpg"
+                save_thumbnail(item.image, os.path.join(session_preview_dir, thumb_filename))
+                previews.append({
+                    "url": f"/api/preview/{session_id}/{thumb_filename}",
+                    "slot": item.slot,
+                    "label": profile_for(item.slot)["label"],
+                    "source": item.url,
+                    "score": round(item.score, 4),
+                    "subject": round(item.subject, 4),
+                })
+
+            # 7. Compile the .pur canvas
+            slug = re.sub(r"[^A-Za-z0-9]+", "_", subject)[:24].strip("_") or "board"
+            filename = f"assemblage_{slug}_{session_id}.pur"
+            out_path = os.path.join(EXPORT_DIR, filename)
+
+            entries = [
+                (item.image, profile_for(item.slot)["label"], item.url) for item in board
+            ]
+            await loop.run_in_executor(None, lambda: build_board(entries, out_path))
+            await loop.run_in_executor(None, lambda: launch_board(out_path))
+
+            yield _sse({
+                "complete": True,
+                "count": len(board),
+                "breakdown": breakdown,
+                "download_url": f"/api/download/{filename}",
+                "mode": mode,
+                "previews": previews,
+            })
+        except Exception:
+            traceback.print_exc()
+            yield _sse({"error": "Something broke on the server while building this board. "
+                                 "The window running Assemblage shows the details."})
 
     return StreamingResponse(run_pipeline(), media_type="text/event-stream")
 

@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-# assemblage
-=======
 # Assemblage
 
 Turns a text prompt into a PureRef board.
@@ -103,4 +100,3 @@ MIT. See `LICENSE`.
 The `.pur` format support comes from
 [FyorDev/PureRef-format](https://github.com/FyorDev/PureRef-format), also MIT.
 See `NOTICE` — this project depends entirely on that reverse-engineering work.
->>>>>>> b3ed0a9 (second commit, for school)
